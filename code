@@ -1,0 +1,126 @@
+var labels = forest.merge(background_forest);
+
+// Spatial split: делю полигоны
+var seed = 50;
+var trainFraction = 0.7;
+
+// Добавляю случайную колонку к каждому полигону
+var labelsRnd = labels.randomColumn('rand', seed);
+
+// Делю полигоны на train/test
+var trainPolys = labelsRnd.filter(ee.Filter.lt('rand', trainFraction));
+var testPolys  = labelsRnd.filter(ee.Filter.gte('rand', trainFraction));
+
+print('Train polys:', trainPolys.size());
+print('Test polys:', testPolys.size());
+print('Train poly class distribution:', trainPolys.aggregate_histogram('class'));
+print('Test poly class distribution:', testPolys.aggregate_histogram('class'));
+
+// Загружаю AlphaEarth embeddings за 2024
+var year = 2022;
+var startDate = ee.Date.fromYMD(year, 1, 1);
+var endDate = startDate.advance(1, 'year');
+
+var emb = ee.ImageCollection('GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL')
+  .filterDate(startDate, endDate)
+  .filterBounds(region);
+
+var embImage = emb.mosaic().clip(region);
+print('Embedding bands:', embImage.bandNames());
+
+// Мозаика
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(region)
+  .filterDate('2022-05-01', '2022-09-30')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));
+
+var s2Mosaic = s2.median().clip(region);
+
+var rgbVis = {
+  bands: ['B4', 'B3', 'B2'],
+  min: 0,
+  max: 3000
+};
+
+// Сэмплирую пиксели отдельно для train/test
+var scale = 10;
+
+// Sampling теперь идёт по trainPolys и testPolys отдельно
+var trainSamples = embImage.sampleRegions({
+  collection: trainPolys,
+  properties: ['class'],
+  scale: scale,
+  tileScale: 4
+});
+
+var testSamples = embImage.sampleRegions({
+  collection: testPolys,
+  properties: ['class'],
+  scale: scale,
+  tileScale: 4
+});
+
+print('Train sample size:', trainSamples.size());
+print('Test sample size:', testSamples.size());
+print('Train sample class distribution:', trainSamples.aggregate_histogram('class'));
+print('Test sample class distribution:', testSamples.aggregate_histogram('class'));
+
+// Обучаю Random Forest
+var nTrees = 100;
+
+var classifier = ee.Classifier.smileRandomForest({
+  numberOfTrees: nTrees,
+  seed: seed
+}).train({
+  features: trainSamples,
+  classProperty: 'class',
+  inputProperties: embImage.bandNames()
+});
+
+// Классификация всей территории
+var classified = embImage.classify(classifier);
+
+// Оставляю лес
+var forestOnly = classified.eq(1);
+
+// Делаю остальные пиксели прозрачными
+var forestMask = forestOnly.updateMask(forestOnly);
+
+// Центр карты
+Map.centerObject(region, 10);
+
+// Сначала показываю мозаику Sentinel-2
+Map.addLayer(s2Mosaic, rgbVis, 'Sentinel-2 mosaic');
+
+// Потом только лес поверх мозаики
+Map.addLayer(
+  forestMask,
+  {palette: ['00AA00']},
+  'Forest only'
+);
+
+Map.addLayer(classified, param_forest, 'AlphaEarth RF full', false);
+
+// Оценка качества на testSamples
+var testClassified = testSamples.classify(classifier);
+var cm = testClassified.errorMatrix('class', 'classification');
+
+print('Confusion Matrix (spatial split):', cm);
+print('Overall Accuracy:', cm.accuracy());
+print('Kappa:', cm.kappa());
+
+// Precision/Recall/F1 для класса 1
+var cmArray = ee.Array(cm.array());
+
+var CB = cmArray.get([0,0]); // Correct Background
+var CW = cmArray.get([0,1]); // Background classified as Forest (False Positive)
+var UW = cmArray.get([1,0]); // Forest classified as Background (False Negative)
+var WW = cmArray.get([1,1]); // Correct Forest (True Positive)
+
+var precision = WW.divide(WW.add(CW));
+var recall = WW.divide(WW.add(UW));
+var f1 = precision.multiply(recall).multiply(2).divide(precision.add(recall));
+
+print('Precision (class=1):', precision);
+print('Recall (class=1):', recall);
+print('F1-score (class=1):', f1);
